@@ -10,13 +10,7 @@ Welcome to visual_speech_recogntion_darija's documentation!
    :maxdepth: 2
    :caption: Contents:
 
-   introduction
-   getting_started
-   core_components
-   configuration
-   training
-   evaluation_prediction
-   usage
+   guide_inference
    projet-vsr-model_notebook
 
 Indices and tables
