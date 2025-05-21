@@ -1,19 +1,9 @@
-# .readthedocs.yaml (Place this at the ROOT of your project)
-version: 2
-
-sphinx:
-  configuration: docs/conf.py
-
-build:
-  os: ubuntu-22.04
-  tools:
-    python: "3.11"
-  jobs:
-    pre_install:
-      - sudo apt-get update -y
-      - sudo apt-get install -y --no-install-recommends pandoc
-      - sudo apt-get clean
-
-python:
-  install:
-    - requirements: requirements.txt # This tells RTD to look for requirements.txt at the root
+numpy
+matplotlib
+pandas
+torch
+opencv-python
+sphinx
+sphinx-rtd-theme
+nbsphinx
+ipykernel
