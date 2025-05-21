@@ -3,12 +3,17 @@ version: 2
 sphinx:
   configuration: docs/conf.py
 
-python:
-  install:
-    - requirements: requirements.txt
-  version: "3.11"
-
 build:
   os: ubuntu-22.04
   tools:
-    python: "3.11"
+    python: "3.11"  # Corrected placement
+  jobs:
+    pre_install:
+      # Needed for nbsphinx to render plots correctly from notebooks
+      - sudo apt-get update
+      - sudo apt-get install -y pandoc 
+
+python:
+  install:
+    - requirements: requirements.txt
+    # No need to specify python.version here if using build.tools.python
