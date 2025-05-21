@@ -1,20 +1,25 @@
+# .readthedocs.yaml
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
 version: 2
 
-sphinx:
-  configuration: docs/conf.py
-
+# Set the version of Python and other tools you might need
 build:
   os: ubuntu-22.04
   tools:
-    python: "3.11"
-  jobs:
-    pre_install:
-      - sudo apt-get update -y
-      - sudo apt-get install -y --no-install-recommends pandoc
-      - sudo apt-get clean
-      # Add any other system dependencies opencv might need, for example:
-      # - sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
+    python: "3.9" # Or your desired Python version (e.g., "3.8", "3.10", "3.11")
+
+# Configuration for Sphinx
+sphinx:
+  configuration: docs/conf.py  # Path to your Sphinx conf.py file
+
 
 python:
   install:
-    - requirements: requirements.txt
+    - requirements: docs/requirements.txt
+
+formats:
+  - htmlzip
+  # - pdf
+  # - epub
