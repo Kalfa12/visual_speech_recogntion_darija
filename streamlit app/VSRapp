@@ -1,1 +1,1239 @@
+# app.py
+#last 
 
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import numpy as np
+import pandas as pd
+import os
+import io
+import tempfile
+import json
+import random
+from collections import defaultdict
+import subprocess # For yt-dlp
+import re # For sentence splitting in corpus stats
+import matplotlib.pyplot as plt # For plotting losses
+import shutil # For clearing directories
+import webvtt # For VTT parsing
+from io import StringIO # For webvtt parsing
+import zipfile # For handling zip archives
+import traceback # Import traceback globally for error reporting
+import glob # Import glob globally
+import time # For time.time() in data processing pipeline
+import mediapipe as mp # Import MediaPipe for face_mesh
+
+# --- Configuration for Streamlit App and Model ---
+# IMPORTANT: Adjust these paths and parameters as needed
+LOCAL_DATA_ROOT = "data" # This is the top-level folder where video_id folders reside
+LOCAL_VIDEO_DIR = os.path.join(LOCAL_DATA_ROOT, "videos") # For original downloaded video files (if kept)
+# LOCAL_SEGMENTS_DIR is now derived per video: LOCAL_DATA_ROOT/<VIDEO_ID>/segments/
+LOCAL_MODELS_DIR = "models" # Directory to save/load trained models
+LOCAL_CHECKPOINTS_DIR = "checkpoints" # Directory to save training checkpoints
+LOCAL_LOSS_HISTORY_DIR = "logs" # Directory to save loss history
+
+
+LOCAL_SEGMENTS_DIR = os.path.join(LOCAL_DATA_ROOT, "segments") # For zipped segment archives
+
+
+# Ensure directories exist (note: LOCAL_SEGMENTS_DIR will be created within video_id dirs)
+os.makedirs(LOCAL_DATA_ROOT, exist_ok=True)
+os.makedirs(LOCAL_VIDEO_DIR, exist_ok=True) # For downloaded videos directly
+os.makedirs(LOCAL_MODELS_DIR, exist_ok=True)
+os.makedirs(LOCAL_CHECKPOINTS_DIR, exist_ok=True)
+os.makedirs(LOCAL_LOSS_HISTORY_DIR, exist_ok=True)
+
+# Model Hyperparameters (must match the trained model or your desired training config)
+GRU_HIDDEN_DIM = 256
+GRU_NUM_LAYERS = 2
+BOTTLENECK_DIM = 256
+
+IMG_HEIGHT = 96
+IMG_WIDTH = 96
+
+# Alphabet used during training (must match)
+arabic_alphabet_str = " اأبتثجحخدذرزسشصضطظعغفقكلمنهويىءؤئآة"
+
+# Persistence files for data splitting logic
+VAL_SEGMENT_PATHS_FILE = os.path.join(LOCAL_DATA_ROOT, "val_segment_paths.json")
+
+@st.cache_resource
+def load_trained_model(model_name, _char_map_instance): # Changed parameter name to _char_map_instance
+    model_path = os.path.join(LOCAL_MODELS_DIR, model_name)
+    NUM_CLASSES = _char_map_instance.vocab_size # Use _char_map_instance here
+
+    model = NewVSRModel(
+        num_classes=NUM_CLASSES, input_channel=1,
+        rnn_hidden_size=GRU_HIDDEN_DIM, rnn_num_layers=GRU_NUM_LAYERS,
+        bottleneck_dim=BOTTLENECK_DIM
+    )
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    try:
+        loaded_content = torch.load(model_path, map_location=device)
+        
+        # Adjust state_dict keys for DataParallel mismatch if any
+        if isinstance(loaded_content, dict) and 'model_state_dict' in loaded_content:
+            loaded_state_dict = loaded_content['model_state_dict']
+        else: # Assume it's a raw state_dict
+            loaded_state_dict = loaded_content
+        
+        # Remove 'module.' prefix if present in loaded_state_dict (common if saved from DataParallel)
+        # as we are likely loading into a non-DataParallel model, or if the current model is already wrapped
+        loaded_state_dict = {k.replace('module.', ''): v for k, v in loaded_state_dict.items()}
+
+        model.load_state_dict(loaded_state_dict)
+        model.eval() # Set model to evaluation mode
+        model.to(device)
+        st.success(f"Model '{model_name}' loaded successfully for prediction!")
+        return model, device
+    except FileNotFoundError:
+        st.error(f"Error: Model file '{model_name}' not found at '{model_path}'. Please train a model first or ensure the file exists.")
+        return None, None
+    except Exception as e:
+        st.error(f"Error loading model '{model_name}': {e}")
+        return None, None
+
+
+# VSRapp.py
+
+# ... (keep all the code before this, including the corrected scan_local_segments_for_metadata) ...
+
+def train_model_streamlit(num_epochs, batch_size, learning_rate):
+    st.info("Starting the training process...")
+    
+    # --- 1. Setup and Data Loading ---
+    char_map_instance = CharMap(arabic_alphabet_str)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    st.write(f"Using device: `{device}`")
+
+    # Load all available metadata
+    all_metadata = scan_local_segments_for_metadata()
+    if not all_metadata:
+        st.error("No data found to train on. Please process videos first.")
+        return
+
+    # --- 2. Data Splitting (Train/Validation) ---
+    val_segment_paths = set()
+    if os.path.exists(VAL_SEGMENT_PATHS_FILE):
+        with open(VAL_SEGMENT_PATHS_FILE, 'r') as f:
+            val_segment_paths = set(json.load(f))
+    
+    train_metadata, val_metadata = [], []
+    if val_segment_paths:
+        st.write("Using existing train/validation split from `val_segment_paths.json`.")
+        for m in all_metadata:
+            if m['archive_path'] in val_segment_paths:
+                val_metadata.append(m)
+            else:
+                train_metadata.append(m)
+    else:
+        st.write("Creating a new 90/10 train/validation split.")
+        random.shuffle(all_metadata)
+        split_idx = int(len(all_metadata) * 0.9)
+        train_metadata = all_metadata[:split_idx]
+        val_metadata = all_metadata[split_idx:]
+        # Save the validation paths for future runs
+        with open(VAL_SEGMENT_PATHS_FILE, 'w') as f:
+            json.dump([m['archive_path'] for m in val_metadata], f)
+
+    st.write(f"Training samples: {len(train_metadata)}, Validation samples: {len(val_metadata)}")
+
+    # --- 3. Create Datasets and DataLoaders ---
+    train_dataset = VSRDataset(char_map_instance=char_map_instance, img_size=(IMG_HEIGHT, IMG_WIDTH), is_train=True, metadata_list_override=train_metadata)
+    val_dataset = VSRDataset(char_map_instance=char_map_instance, img_size=(IMG_HEIGHT, IMG_WIDTH), is_train=False, metadata_list_override=val_metadata)
+
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, char_map_instance), num_workers=0)
+    val_loader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, char_map_instance), num_workers=0)
+
+    # --- 4. Initialize Model, Optimizer, and Loss Function ---
+    model = NewVSRModel(num_classes=char_map_instance.get_vocab_size(), rnn_hidden_size=GRU_HIDDEN_DIM, rnn_num_layers=GRU_NUM_LAYERS, bottleneck_dim=BOTTLENECK_DIM).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    ctc_loss_fn = nn.CTCLoss(blank=char_map_instance.get_blank_token_idx(), reduction='mean', zero_infinity=True).to(device)
+
+    # --- 5. Training Loop ---
+    st.markdown("---")
+    st.header("Training Progress")
+    
+    # Placeholders for live updates
+    epoch_placeholder = st.empty()
+    loss_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    
+    best_val_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_train_loss = 0.0
+        
+        for batch_idx, data in enumerate(train_loader):
+            if data is None: continue
+            
+            padded_sequences, padded_targets, seq_lengths, target_lengths = data
+            padded_sequences = padded_sequences.to(device)
+            
+            optimizer.zero_grad()
+            output_log_probs = model(padded_sequences).permute(1, 0, 2) # (T, B, C) for CTCLoss
+            
+            input_lengths = torch.clamp(seq_lengths, max=output_log_probs.size(0))
+
+            if torch.any(target_lengths <= 0) or torch.any(input_lengths <= 0):
+                continue
+                
+            loss = ctc_loss_fn(output_log_probs, padded_targets, input_lengths, target_lengths)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            loss.backward()
+            optimizer.step()
+            epoch_train_loss += loss.item()
+
+            # Update Streamlit UI
+            progress = (batch_idx + 1) / len(train_loader)
+            progress_bar.progress(progress)
+            epoch_placeholder.text(f"Epoch {epoch + 1}/{num_epochs} | Batch {batch_idx + 1}/{len(train_loader)}")
+            loss_placeholder.text(f"Current Batch Loss: {loss.item():.4f}")
+
+        avg_train_loss = epoch_train_loss / len(train_loader)
+
+        # Validation phase
+        model.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for data in val_loader:
+                if data is None: continue
+                padded_sequences, padded_targets, seq_lengths, target_lengths = data
+                padded_sequences = padded_sequences.to(device)
+                
+                output_log_probs = model(padded_sequences).permute(1, 0, 2)
+                input_lengths = torch.clamp(seq_lengths, max=output_log_probs.size(0))
+
+                if torch.any(target_lengths <= 0) or torch.any(input_lengths <= 0):
+                    continue
+
+                val_loss = ctc_loss_fn(output_log_probs, padded_targets, input_lengths, target_lengths)
+                epoch_val_loss += val_loss.item()
+        
+        avg_val_loss = epoch_val_loss / len(val_loader)
+        st.write(f"Epoch {epoch + 1} Summary -> Avg Train Loss: {avg_train_loss:.4f} | Avg Validation Loss: {avg_val_loss:.4f}")
+
+        # Save checkpoint
+        checkpoint_path = os.path.join(LOCAL_CHECKPOINTS_DIR, f"vsr_checkpoint_epoch_{epoch+1}.pth")
+        torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'val_loss': avg_val_loss}, checkpoint_path)
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_path = os.path.join(LOCAL_MODELS_DIR, "best_vsr_model.pth")
+            torch.save(model.state_dict(), best_model_path)
+            st.write(f"✨ New best model saved to `{best_model_path}` with validation loss: {best_val_loss:.4f}")
+    
+    st.success("Training finished!")
+
+
+
+
+def scan_local_segments_for_metadata(data_root_dir=LOCAL_DATA_ROOT):
+    """
+    Scans the data root directory for video folders, reads their metadata CSVs,
+    and returns a single consolidated list of all segment metadata.
+    """
+    all_metadata_list = []
+    # Get all subdirectories in the data_root_dir, excluding reserved names
+    video_id_folders = [
+        d for d in os.listdir(data_root_dir)
+        if os.path.isdir(os.path.join(data_root_dir, d))
+        and d not in ["videos", "segments", "models", "checkpoints", "logs"]
+    ]
+
+    for video_id in sorted(video_id_folders):
+        video_dir_path = os.path.join(data_root_dir, video_id)
+        metadata_csv_path = os.path.join(video_dir_path, f"{video_id}_metadata.csv")
+
+        if os.path.exists(metadata_csv_path):
+            try:
+                # Read the metadata for the current video
+                df = pd.read_csv(metadata_csv_path)
+                # Add the video's metadata to the main list
+                all_metadata_list.extend(df.to_dict('records'))
+            except Exception as e:
+                st.warning(f"Could not read or process metadata for '{video_id}': {e}")
+    
+    if video_id_folders:
+        st.info(f"Scanned {len(all_metadata_list)} total segments across {len(video_id_folders)} local video(s).")
+        
+    return all_metadata_list
+
+
+
+# --- Core Model and Data Classes (defined first as they are fundamental building blocks) ---
+
+class CharMap:
+    def __init__(self, alphabet_string):
+        self.SOS_token = None
+        self.EOS_token = None
+        self.BLANK_token_idx = 0
+        self.char_to_int = {char: i + 1 for i, char in enumerate(alphabet_string)}
+        self.int_to_char = {i + 1: char for i, char in enumerate(alphabet_string)}
+        self.int_to_char[self.BLANK_token_idx] = "<BLANK>"
+        self.char_to_int["<BLANK>"] = self.BLANK_token_idx
+        self.vocab_size = len(self.char_to_int)
+
+    def get_char_to_int_map(self): return self.char_to_int
+    def get_int_to_char_map(self): return self.int_to_char
+    def get_vocab_size(self): return self.vocab_size
+    def get_blank_token_idx(self): return self.BLANK_token_idx
+
+    def text_to_indices(self, text):
+        indices = [self.char_to_int.get(char) for char in text if char in self.char_to_int]
+        return [idx for idx in indices if idx is not None]
+
+    def indices_to_text(self, indices, remove_blanks=True, remove_duplicates=True):
+        text = []
+        last_char_idx = -1
+        for idx in indices:
+            idx_val = idx.item() if isinstance(idx, torch.Tensor) else idx
+            if idx_val == self.BLANK_token_idx and remove_blanks:
+                last_char_idx = -1
+                continue
+            if remove_duplicates and idx_val == last_char_idx:
+                continue
+            char = self.int_to_char.get(idx_val)
+            if char: text.append(char)
+            if idx_val != self.BLANK_token_idx: last_char_idx = idx_val
+            elif not remove_blanks: last_char_idx = idx_val
+        return "".join(text)
+
+
+class NewVSRModel(nn.Module):
+    def __init__(self, num_classes, input_channel=1, rnn_hidden_size=256, rnn_num_layers=2, bottleneck_dim=256):
+        super(NewVSRModel, self).__init__()
+        self.frontend3D = nn.Sequential(
+            nn.Conv3d(input_channel, 64, kernel_size=(3, 5, 5), stride=(1, 2, 2), padding=(1, 2, 2), bias=False),
+            nn.BatchNorm3d(64), nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+            nn.Conv3d(64, 128, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1), bias=False),
+            nn.BatchNorm3d(128), nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=(0, 0, 0))
+        )
+        self.frontend3D_output_channels = 128
+        self.backend2D = nn.Sequential(
+            nn.Conv2d(self.frontend3D_output_channels, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(512), nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(512), nn.ReLU(inplace=True)
+        )
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1,1))
+        self.backend2D_output_features = 512
+        self.bottleneck_linear = nn.Linear(self.backend2D_output_features, bottleneck_dim)
+        self.bottleneck_relu = nn.ReLU(inplace=True)
+        self.blstm1 = nn.LSTM(bottleneck_dim, rnn_hidden_size, num_layers=rnn_num_layers,
+                              bidirectional=True, batch_first=True, dropout=0.2 if rnn_num_layers > 1 else 0)
+        self.blstm2 = nn.LSTM(rnn_hidden_size * 2, rnn_hidden_size, num_layers=rnn_num_layers,
+                              bidirectional=True, batch_first=True, dropout=0.2 if rnn_num_layers > 1 else 0)
+        self.output_linear = nn.Linear(rnn_hidden_size * 2, num_classes)
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        x = x.permute(0, 2, 1, 3, 4)
+        x = self.frontend3D(x)
+        x = x.permute(0, 2, 1, 3, 4)
+        C_3D_out = x.size(2)
+        x = x.contiguous().view(B * T, C_3D_out, x.size(3), x.size(4))
+        x = self.backend2D(x)
+        x = self.adaptive_pool(x)
+        x = x.view(B * T, -1)
+        x = x.view(B, T, self.backend2D_output_features)
+        x = self.bottleneck_linear(x)
+        x = self.bottleneck_relu(x)
+        self.blstm1.flatten_parameters()
+        x, _ = self.blstm1(x)
+        self.blstm2.flatten_parameters()
+        x, _ = self.blstm2(x)
+        x = self.output_linear(x)
+        output_log_probs = F.log_softmax(x, dim=2)
+        return output_log_probs
+
+# --- Data Loading and Collating for PyTorch (uses CharMap) ---
+class VSRDataset(torch.utils.data.Dataset):
+    def __init__(self, char_map_instance, img_size=(96, 96), is_train=True, augmentation_prob=0.5, metadata_list_override=None):
+        super().__init__()
+        self.char_map = char_map_instance
+        self.img_size = img_size
+        self.is_train = is_train
+        self.augmentation_prob = augmentation_prob
+        self.metadata_list = metadata_list_override if metadata_list_override is not None else []
+        # A more concise info message for the UI
+        # st.info(f"  [VSRDataset] Initialized with {len(self.metadata_list)} samples.")
+
+    def __len__(self):
+        return len(self.metadata_list)
+
+    def __getitem__(self, idx):
+        if idx >= len(self.metadata_list):
+            raise IndexError("Index out of bounds")
+
+        sample_info = self.metadata_list[idx]
+        full_archive_path = os.path.join(LOCAL_DATA_ROOT, sample_info['archive_path'])
+        text_label = str(sample_info['text'])
+        
+        frames = []
+        temp_unzip_base = None
+        try:
+            if not os.path.exists(full_archive_path):
+                # Using st.warning for non-critical runtime issues
+                st.warning(f"Archive file not found: {full_archive_path}. Skipping.")
+                return None
+
+            temp_unzip_base = tempfile.mkdtemp(prefix=f"vsr_unzip_{sample_info['segment_id']}_")
+            
+            with zipfile.ZipFile(full_archive_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_unzip_base)
+            
+            # --- THIS IS THE FIX ---
+            # The frames are extracted directly into the temp_unzip_base directory.
+            # We search for images directly in this temp folder now.
+            extracted_frames_dir = temp_unzip_base 
+
+            frame_files = sorted(
+                list(glob.glob(os.path.join(extracted_frames_dir, '*.png'))) +
+                list(glob.glob(os.path.join(extracted_frames_dir, '*.jpg'))) +
+                list(glob.glob(os.path.join(extracted_frames_dir, '*.jpeg')))
+            )
+
+            if not frame_files:
+                st.warning(f"No frames found after unzipping {sample_info['archive_path']}. Skipping segment.")
+                return None
+            
+            for frame_filepath in frame_files:
+                img_bgr = cv2.imread(frame_filepath, cv2.IMREAD_COLOR)
+                if img_bgr is None: continue
+                img_resized = cv2.resize(img_bgr, self.img_size, interpolation=cv2.INTER_LINEAR)
+                img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+                if self.is_train and random.random() < self.augmentation_prob:
+                    img_gray = cv2.flip(img_gray, 1)
+                img_normalized = img_gray.astype(np.float32) / 255.0
+                frames.append(img_normalized)
+        except Exception as e:
+            st.error(f"Error processing segment from archive {full_archive_path}: {e}")
+            return None
+        finally:
+            if temp_unzip_base and os.path.exists(temp_unzip_base):
+                shutil.rmtree(temp_unzip_base, ignore_errors=True)
+        
+        if not frames: return None
+        frames_tensor = torch.tensor(np.array(frames), dtype=torch.float32).unsqueeze(1)
+        text_indices = self.char_map.text_to_indices(text_label)
+        if not text_indices: return None
+        text_tensor = torch.tensor(text_indices, dtype=torch.long)
+        return frames_tensor, text_tensor
+
+def collate_fn(batch, char_map_instance_for_collate):
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
+    sequences, targets = zip(*batch)
+    seq_lengths = torch.tensor([s.size(0) for s in sequences], dtype=torch.long)
+    target_lengths = torch.tensor([t.size(0) for t in targets], dtype=torch.long)
+    padded_sequences = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    padded_targets = torch.nn.utils.rnn.pad_sequence(targets, batch_first=True, padding_value=char_map_instance_for_collate.get_blank_token_idx())
+    return padded_sequences, padded_targets, seq_lengths, target_lengths
+
+
+# --- General Utility Functions (independent of VSR specific classes, ordered by dependency) ---
+
+# Evaluation metric functions
+def levenshtein_distance(s1, s2):
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+def calculate_wer_cer(ground_truths, predictions):
+    total_wer_distance = 0
+    total_wer_words = 0
+    total_cer_distance = 0
+    total_cer_chars = 0
+
+    for gt_text, pred_text in zip(ground_truths, predictions):
+        gt_words = gt_text.split()
+        pred_words = pred_text.split()
+        
+        total_wer_distance += levenshtein_distance(" ".join(gt_words), " ".join(pred_words))
+        total_wer_words += len(gt_words)
+
+        total_cer_distance += levenshtein_distance(gt_text, pred_text)
+        total_cer_chars += len(gt_text)
+
+    wer = (total_wer_distance / total_wer_words) * 100 if total_wer_words > 0 else float('inf')
+    cer = (total_cer_distance / total_cer_chars) * 100 if total_cer_chars > 0 else float('inf')
+
+    return wer, cer
+
+def compute_corpus_stats(dataset, char_map_instance):
+    all_words = set()
+    sentence_count = 0
+    total_segments = 0
+    
+    for i in range(len(dataset)):
+        item = dataset[i]
+        if item is None:
+            continue
+        
+        total_segments += 1
+        text_indices = item[1].tolist()
+        raw_text = char_map_instance.indices_to_text(text_indices, remove_blanks=False, remove_duplicates=False)
+
+        sentences = [s.strip() for s in re.split(r'[.?!]', raw_text) if s.strip()]
+        sentence_count += len(sentences)
+
+        words = raw_text.lower().split()
+        for word in words:
+            cleaned_word = ''.join(char for char in word if char.isalnum())
+            if cleaned_word:
+                all_words.add(cleaned_word)
+    
+    return len(all_words), sentence_count, total_segments
+
+# Video preprocessing helper functions (from your notebook pipeline)
+# Constants
+TARGET_FPS = 30
+MOUTH_CROP_PADDING_FACTOR = 0.5
+MOUTH_LANDMARK_INDICES = [
+    61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, # Outer Upper
+    78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, # Outer Lower
+]
+
+def time_str_to_seconds(time_str):
+    parts = time_str.split(':')
+    try:
+        if len(parts) == 3:
+            h, m, s_ms = parts
+            return int(h) * 3600 + int(m) * 60 + float(s_ms)
+        elif len(parts) == 2:
+            m, s_ms = parts
+            return int(m) * 60 + float(s_ms)
+        else:
+            return float(time_str)
+    except ValueError:
+        return 0.0
+
+def parse_vtt(vtt_filepath):
+    segments = []
+    if not vtt_filepath or not os.path.exists(vtt_filepath): return []
+    try:
+        with open(vtt_filepath, 'r', encoding='utf-8-sig') as f:
+            vtt_content = f.read()
+        captions = list(webvtt.read_buffer(StringIO(vtt_content)))
+        for i, caption in enumerate(captions):
+            try:
+                start_sec = time_str_to_seconds(caption.start)
+                end_sec = time_str_to_seconds(caption.end)
+                text = " ".join(caption.text.strip().split())
+                if text and (end_sec > start_sec) and (end_sec - start_sec > 0.01):
+                    segments.append({"start": start_sec, "end": end_sec, "text": text})
+            except Exception:
+                continue
+        return segments
+    except Exception as e:
+        return []
+
+mp_face_mesh = mp.solutions.face_mesh # Re-declare outside func if it was local
+
+def detect_and_crop_lips(frame_bgr, face_mesh_processor):
+    try:
+        img_h, img_w, _ = frame_bgr.shape
+        results = face_mesh_processor.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        if not results.multi_face_landmarks: return None
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        mouth_points = []
+        for idx in MOUTH_LANDMARK_INDICES:
+            if idx < len(face_landmarks):
+                lm = face_landmarks[idx]
+                mouth_points.append((int(lm.x * img_w), int(lm.y * img_h)))
+        if len(mouth_points) < 5: return None
+        x_coords, y_coords = zip(*mouth_points)
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+        padding = int((x_max - x_min) * MOUTH_CROP_PADDING_FACTOR / 2)
+        x_min_pad, x_max_pad = max(0, x_min - padding), min(img_w, x_max + padding)
+        y_min_pad, y_max_pad = max(0, y_min - padding), min(img_h, y_max + padding)
+        if x_min_pad >= x_max_pad or y_min_pad >= y_max_pad: return None
+        cropped_lip = frame_bgr[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+        return cropped_lip if cropped_lip.size > 0 else None
+    except Exception: return None
+
+def extract_frames_from_segment(video_segment_path, output_frames_dir, face_mesh_processor):
+    if not os.path.exists(video_segment_path) or os.path.getsize(video_segment_path) < 100: return []
+    if face_mesh_processor is None: st.error(f"ERROR: MediaPipe processor not initialized for frame extraction."); return []
+    try: os.makedirs(output_frames_dir, exist_ok=True)
+    except OSError as e: st.error(f"ERROR: Creating output dir {output_frames_dir}: {e}"); return []
+
+    frame_paths = []; cap = None; frame_count_saved = 0
+    try:
+        cap = cv2.VideoCapture(video_segment_path)
+        if not cap.isOpened(): st.error(f"ERROR: cv2.VideoCapture failed for {os.path.basename(video_segment_path)}"); return []
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            cropped_lip = detect_and_crop_lips(frame, face_mesh_processor)
+            if cropped_lip is not None:
+                frame_filename = f"frame_{frame_count_saved + 1:06d}.png"
+                frame_path = os.path.join(output_frames_dir, frame_filename)
+                write_success = cv2.imwrite(frame_path, cropped_lip)
+                if write_success:
+                    frame_paths.append(frame_path)
+                    frame_count_saved += 1
+                else:
+                    st.warning(f"Failed to save frame to {frame_path}")
+            # else: st.info(f"Skipping frame {frame_count_saved} due to no lip detection.") # Too verbose for app
+    except Exception as e: st.error(f"ERROR in extraction loop for {os.path.basename(video_segment_path)}: {e}"); traceback.print_exc()
+    finally:
+        if cap: cap.release()
+    return frame_paths
+
+def cut_video_segment(input_video, start_time, end_time, output_segment_path, ffmpeg_path='ffmpeg'):
+    duration = end_time - start_time
+    if duration <= 0.01: return False
+    os.makedirs(os.path.dirname(output_segment_path), exist_ok=True)
+
+    ffmpeg_executable = ffmpeg_path if ffmpeg_path else 'ffmpeg' 
+
+    cmd = [
+        ffmpeg_executable,
+        '-i', input_video,
+        '-ss', f"{start_time:.4f}",
+        '-to', f"{end_time:.4f}",
+        '-map', '0:v',
+        '-vf', f'fps={TARGET_FPS}',
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-an',
+        '-y',
+        '-loglevel', 'warning',
+        output_segment_path
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+        if not os.path.exists(output_segment_path) or os.path.getsize(output_segment_path) < 100:
+            st.warning(f"FFmpeg cut command ran but output file is missing or too small: {output_segment_path}. Stderr: {result.stderr[-500:]}")
+            if os.path.exists(output_segment_path): os.remove(output_segment_path)
+            return False
+        return True
+    except FileNotFoundError:
+        st.error(f"FATAL ERROR: Could not find the ffmpeg executable at '{ffmpeg_executable}'. Please ensure FFmpeg is installed and added to your system's PATH, or provide the full path in the input field.")
+        return False
+    except subprocess.CalledProcessError as e:
+        st.error(f"Error cutting segment {os.path.basename(output_segment_path)}: {e.stderr[-500:]}")
+        if os.path.exists(output_segment_path):
+            try: os.remove(output_segment_path)
+            except OSError: pass
+        return False
+    except Exception as e:
+         st.error(f"An unexpected error occurred during cutting for {os.path.basename(output_segment_path)}: {e}")
+         traceback.print_exc()
+         return False
+
+def download_video_and_subs(youtube_url, temp_download_dir, ffmpeg_path):
+    video_id = youtube_url.split("v=")[-1].split("&")[0] if "v=" in youtube_url else "unknown_id_" + str(int(time.time()))
+    output_template = os.path.join(temp_download_dir, '%(id)s.%(ext)s')
+    
+    # Check if video already exists in LOCAL_VIDEO_DIR
+    existing_video_path = os.path.join(LOCAL_VIDEO_DIR, f"{video_id}.mp4") # Assume mp4 for checking
+    if os.path.exists(existing_video_path) and os.path.getsize(existing_video_path) > 1000:
+        st.info(f"Original video file for {video_id} already exists. Using existing file.")
+        # Check if corresponding subtitle exists
+        expected_sub_path_local = os.path.join(LOCAL_VIDEO_DIR, f"{video_id}.ar.vtt")
+        if os.path.exists(expected_sub_path_local):
+            return video_id, existing_video_path, expected_sub_path_local
+        else:
+            st.warning(f"Subtitle for {video_id} not found locally. Attempting to download only subtitles.")
+            sub_cmd = ['yt-dlp', '--encoding', 'utf-8', '--write-auto-sub', '--sub-lang', 'ar',
+                       '--sub-format', 'vtt', '-o', output_template, '--skip-download', youtube_url]
+            if ffmpeg_path and os.path.exists(ffmpeg_path):
+                sub_cmd.extend(['--ffmpeg-location', os.path.dirname(ffmpeg_path)])
+            
+            try:
+                subprocess.run(sub_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                found_subs = [f for f in os.listdir(temp_download_dir) if f.startswith(video_id) and f.endswith('.vtt')]
+                if found_subs:
+                    shutil.move(os.path.join(temp_download_dir, found_subs[0]), expected_sub_path_local)
+                    st.success(f"Subtitle for {video_id} downloaded and moved locally.")
+                    return video_id, existing_video_path, expected_sub_path_local
+            except Exception as sub_e:
+                st.error(f"Error downloading only subtitle: {sub_e}")
+                return video_id, existing_video_path, None # Video exists, but no subtitle
+
+    st.info(f"Attempting download for {youtube_url} to {temp_download_dir}")
+    cmd = [
+        'yt-dlp', '--encoding', 'utf-8', '--write-auto-sub', '--sub-lang', 'ar',
+        '--sub-format', 'vtt', '-f',
+        'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best[ext=mp4]/best',
+        '-o', output_template, '--merge-output-format', 'mp4', '--socket-timeout', '60',
+        '--retries', '5', '--progress', '--ignore-config', '--no-cache-dir', youtube_url
+    ]
+    if ffmpeg_path and os.path.exists(ffmpeg_path):
+        cmd.extend(['--ffmpeg-location', os.path.dirname(ffmpeg_path)])
+
+    video_file = None; sub_file = None
+    try:
+        st.write(f"Running yt-dlp download for video ID: {video_id}...")
+        process = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', check=False, timeout=600)
+        
+        if process.returncode != 0:
+            st.error(f"Error: yt-dlp exited code {process.returncode}. Stderr: {process.stderr[-500:]}")
+            if "ffmpeg not found" in process.stderr.lower():
+                st.error("FFmpeg not found! Please ensure FFmpeg is installed and added to your system's PATH, or provide the full path in the input field.")
+            return video_id, None, None
+
+        actual_files = os.listdir(temp_download_dir)
+        
+        expected_sub_path_temp = os.path.join(temp_download_dir, f"{video_id}.ar.vtt")
+        possible_video_exts = ['.mp4', '.mkv', '.webm']
+
+        # Find subtitle file
+        if os.path.exists(expected_sub_path_temp): sub_file = expected_sub_path_temp
+        else:
+            found_subs = [f for f in actual_files if f.startswith(video_id) and f.endswith('.vtt')]
+            if found_subs: sub_file = os.path.join(temp_download_dir, found_subs[0])
+
+        # Find video file
+        for ext in possible_video_exts:
+            expected_video_path_temp = os.path.join(temp_download_dir, f"{video_id}{ext}")
+            if os.path.exists(expected_video_path_temp) and os.path.getsize(expected_video_path_temp) > 1000:
+                video_file = expected_video_path_temp
+                break
+        
+        if not video_file: 
+            st.error(f"Error: Video file not found or too small in temp directory after download.")
+            return video_id, None, sub_file # Return sub_file if found, even if no video
+
+        # Move downloaded files to LOCAL_VIDEO_DIR for persistence
+        final_video_path_local = os.path.join(LOCAL_VIDEO_DIR, os.path.basename(video_file))
+        shutil.move(video_file, final_video_path_local)
+        video_file = final_video_path_local
+        st.info(f"Downloaded video moved to: {video_file}")
+
+        if sub_file:
+            final_sub_path_local = os.path.join(LOCAL_VIDEO_DIR, os.path.basename(sub_file))
+            shutil.move(sub_file, final_sub_path_local)
+            sub_file = final_sub_path_local
+            st.info(f"Downloaded subtitle moved to: {sub_file}")
+        else:
+            st.warning(f"Subtitle file not found for {video_id}. Segments will be processed without transcription for this video.")
+
+
+        st.success(f"Download and move successful for {video_id}.")
+        return video_id, video_file, sub_file
+    except subprocess.TimeoutExpired:
+        st.error(f"Error: yt-dlp timed out for {youtube_url}.")
+        return video_id, None, None
+    except Exception as e:
+        st.error(f"Unexpected download error for {youtube_url}: {e}")
+        traceback.print_exc()
+        return video_id, None, None
+    
+def process_video_local_full_pipeline(youtube_url, base_output_dir, ffmpeg_path):
+    """
+    Processes a single YouTube video, extracts segments and frames, saves locally.
+    Returns video_id, frame_count, status_message on success. Returns None, 0, error_message on failure.
+    """
+    video_metadata_list = []
+    
+    with tempfile.TemporaryDirectory(prefix="vsr_temp_pipeline_") as temp_download_dir:
+        st.info(f"Starting pipeline for {youtube_url}")
+        
+        face_mesh_processor = None
+        try:
+            face_mesh_processor = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.3)
+            st.info("MediaPipe FaceMesh initialized.")
+        except Exception as e:
+            st.error(f"CRITICAL ERROR initializing MediaPipe FaceMesh: {e}")
+            return None, 0, "Critical error: MediaPipe initialization failed."
+
+        try:
+            # 1. Download Video and Subtitles
+            video_id, video_filepath, sub_filepath = download_video_and_subs(youtube_url, temp_download_dir, ffmpeg_path)
+            if video_id is None or video_filepath is None: # Check if download_video_and_subs failed
+                return None, 0, "Video download/initialization failed. Check previous error messages."
+
+            # 2. Parse VTT
+            segments_from_vtt = parse_vtt(sub_filepath) if sub_filepath and os.path.exists(sub_filepath) else []
+            if not segments_from_vtt:
+                st.warning(f"No valid subtitle segments found for {video_id}. Creating dummy segment for pipeline demonstration.")
+                cap_dummy = cv2.VideoCapture(video_filepath)
+                if cap_dummy.isOpened():
+                    fps = cap_dummy.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap_dummy.get(cv2.CAP_PROP_FRAME_COUNT))
+                    total_duration = total_frames / fps
+                    cap_dummy.release()
+                    segments_from_vtt = [{"start": 0.0, "end": total_duration, "text": "UNLABELED_NO_SUBTITLES"}]
+                else:
+                    st.error(f"Could not open video {video_filepath} to estimate duration for dummy segments.")
+                    return None, 0, "Video processing failed: could not open for duration estimate."
+
+
+            # 3. Define Final LOCAL Output Dirs
+            video_output_dir_local = os.path.join(base_output_dir, video_id)
+            segment_base_dir_local = os.path.join(video_output_dir_local, "segments") # This is like data/VIDEO_ID/segments
+            os.makedirs(segment_base_dir_local, exist_ok=True)
+            
+            video_meta_for_csv = [] # Temp list to build for this video's metadata CSV
+
+            st.info(f"Processing {len(segments_from_vtt)} segments for video {video_id}...")
+            
+            segment_progress_bar = st.progress(0)
+            segment_status_text = st.empty()
+
+            for i, segment_info in enumerate(segments_from_vtt):
+                segment_id = f"segment_{i+1:04d}"
+                start_t, end_t = segment_info['start'], segment_info['end']
+                text_label = segment_info['text']
+
+                segment_status_text.text(f"Processing Segment {i+1}/{len(segments_from_vtt)}: {segment_id} ({start_t:.2f}s - {end_t:.2f}s)")
+                segment_progress_bar.progress((i + 1) / len(segments_from_vtt))
+
+                if (end_t - start_t) < 0.05:
+                    st.warning(f"Skipping segment {segment_id} due to very short duration.")
+                    continue
+
+                segment_video_temp_path = os.path.join(temp_download_dir, f"{video_id}_{segment_id}.mp4")
+                local_temp_frames_output_dir = os.path.join(temp_download_dir, "temp_frames", video_id, segment_id)
+                
+                # 4. Cut Segment
+                if not cut_video_segment(video_filepath, start_t, end_t, segment_video_temp_path, ffmpeg_path): # Pass ffmpeg_path
+                    st.error(f"Failed to cut segment {segment_id}. Skipping frame extraction for this segment.")
+                    continue
+
+                # 5. Extract Frames
+                local_cropped_frame_paths = extract_frames_from_segment(
+                    segment_video_temp_path, local_temp_frames_output_dir, face_mesh_processor)
+
+                # 6. Archive & Move
+                if local_cropped_frame_paths:
+                    # archive_basename will be the full path to the zip file, WITHOUT THE .zip extension
+                    # e.g., data/VIDEO_ID/segments/segment_0000
+                    archive_basename = os.path.join(segment_base_dir_local, segment_id) 
+
+                    try:
+                        # The base_dir should be '.' to zip the contents of root_dir directly.
+                        shutil.make_archive(base_name=archive_basename, format='zip',
+                                            root_dir=local_temp_frames_output_dir,
+                                            base_dir='.')
+
+                        # The rest of the logic remains the same.
+                        relative_archive_path_for_metadata = os.path.relpath(archive_basename + ".zip", LOCAL_DATA_ROOT).replace("\\", "/")
+
+                        video_meta_for_csv.append({
+                            "video_id": video_id, "segment_id": segment_id, "start_time": start_t,
+                            "end_time": end_t, "text": text_label, "num_frames": len(local_cropped_frame_paths),
+                            "archive_path": relative_archive_path_for_metadata, "format": "zip"
+                        })
+                    except Exception as e:
+                        st.error(f"ERROR creating/moving archive for segment {segment_id}: {e}")
+                else:
+                    st.warning(f"Segment {segment_id}: Failed (No frames extracted or lips not detected).")
+
+                # Clean up temp segment video and temp frames dir
+                if os.path.exists(segment_video_temp_path): os.remove(segment_video_temp_path)
+                if os.path.isdir(local_temp_frames_output_dir): shutil.rmtree(local_temp_frames_output_dir)
+
+            # --- Save Metadata for this video ---
+            if video_meta_for_csv:
+                # Metadata CSV path: data/VIDEO_ID/VIDEO_ID_metadata.csv
+                video_metadata_file_local = os.path.join(video_output_dir_local, f"{video_id}_metadata.csv")
+                st.info(f"Saving metadata for {video_id} to: {video_metadata_file_local}")
+                pd.DataFrame(video_meta_for_csv)[["video_id", "segment_id", "start_time", "end_time",
+                                                  "text", "num_frames", "archive_path", "format"]]\
+                  .to_csv(video_metadata_file_local, index=False, encoding='utf-8')
+                st.success(f"Metadata saved locally for {video_id}.")
+                return video_id, len(video_meta_for_csv), f"Processed {len(video_meta_for_csv)} segments from video {video_id}."
+            else:
+                st.warning(f"No metadata generated for {video_id}.")
+                return video_id, 0, f"Video {video_id} processed, but no segments generated."
+
+        except Exception as e:
+            st.error(f"Unexpected error processing {youtube_url} full pipeline: {e}")
+            traceback.print_exc()
+            return None, 0, f"An unhandled error occurred during pipeline for {youtube_url}."
+        finally:
+            if face_mesh_processor:
+                face_mesh_processor.close() # Manually close MediaPipe processor
+
+unique_video_ids_in_local_data = set()
+# --- Streamlit UI ---
+st.set_page_config(page_title="VSR Full Project Demo", layout="wide", initial_sidebar_state="expanded")
+
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["Data Preparation", "Model Training", "Prediction & Evaluation", "Clear Data"])
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Data Root:** `{LOCAL_DATA_ROOT}`")
+st.sidebar.markdown(f"**Models Saved to:** `{LOCAL_MODELS_DIR}`")
+st.sidebar.markdown(f"**Checkpoints Saved to:** `{LOCAL_CHECKPOINTS_DIR}`")
+st.sidebar.markdown(f"**Loss Logs Saved to:** `{LOCAL_LOSS_HISTORY_DIR}`")
+
+st.markdown("""
+# Arabic Video Speech Recognition (VSR) Project
+
+This application demonstrates the full pipeline for VSR: from data preparation (YouTube download, frame extraction, transcription) to model training and finally, prediction and evaluation.
+""")
+
+
+if page == "Data Preparation":
+    st.header("1. Data Preparation: Download & Process YouTube Videos")
+    st.markdown("""
+    Enter a YouTube video URL to download it, extract frames, and retrieve its automatic transcription.
+    The extracted frames and transcription will be saved locally and used for model training.
+    """)
+
+    youtube_url = st.text_input("YouTube Video URL (e.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ)")
+    
+    # New FFmpeg path input
+    ffmpeg_path_input = st.text_input(
+        "FFmpeg Executable Path (Optional)",
+        help="If 'ffmpeg' is not in your system's PATH, enter the full path to your ffmpeg executable here (e.g., C:\\ffmpeg\\bin\\ffmpeg.exe or /usr/local/bin/ffmpeg). Leave empty if it's in PATH."
+    )
+    st.markdown("""
+    **FFmpeg Installation Guide:**
+    * **Windows:** Download a build (e.g., from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)) and extract it. Then, either add its `bin` folder to your system's PATH or provide the full path above.
+    * **macOS:** `brew install ffmpeg` (using Homebrew).
+    * **Linux:** `sudo apt update && sudo apt install ffmpeg` (Debian/Ubuntu).
+    """)
+
+    if st.button("Process Video"):
+        if youtube_url:
+            with st.spinner("Starting video processing pipeline... This may take a while for longer videos and depends on your internet speed and CPU performance."):
+                video_id, frame_count, status_message = process_video_local_full_pipeline(youtube_url, LOCAL_DATA_ROOT, ffmpeg_path_input)
+                st.success(f"Overall Status: {status_message}")
+                if video_id and frame_count > 0:
+                    st.success(f"Successfully processed video '{video_id}' with {frame_count} segments.")
+                # st.experimental_rerun() # Don't rerun immediately, let user see status
+        else:
+            st.warning("Please enter a YouTube video URL.")
+
+    st.subheader("Locally Processed Videos")
+    local_videos_info = {}
+    total_local_segments = 0
+    # Updated: Scan LOCAL_DATA_ROOT for video ID folders and then their metadata
+    video_id_folders_in_data_root = [d for d in os.listdir(LOCAL_DATA_ROOT) if os.path.isdir(os.path.join(LOCAL_DATA_ROOT, d)) and d not in ["videos", "segments", "models", "checkpoints", "logs"]]
+    
+    for video_id_dir_name in sorted(video_id_folders_in_data_root):
+        video_dir_full_path = os.path.join(LOCAL_DATA_ROOT, video_id_dir_name)
+        metadata_csv_name = f"{video_id_dir_name}_metadata.csv"
+        video_metadata_csv_path = os.path.join(video_dir_full_path, metadata_csv_name)
+
+        if os.path.exists(video_metadata_csv_path):
+            try:
+                df_meta = pd.read_csv(video_metadata_csv_path)
+                num_segments_in_video = len(df_meta)
+                local_videos_info[video_id_dir_name] = num_segments_in_video
+                total_local_segments += num_segments_in_video
+                unique_video_ids_in_local_data.add(video_id_dir_name)
+            except Exception as e:
+                st.warning(f"Could not read metadata for {video_metadata_csv_path}: {e}")
+        else:
+            st.info(f"No metadata found for video folder {video_id_dir_name}. It might be an incomplete download or other data.")
+    
+    if local_videos_info:
+        st.markdown(f"**Total unique videos processed: {len(local_videos_info)}**")
+        st.markdown(f"**Total segments available for training: {total_local_segments}**")
+        st.dataframe(pd.DataFrame({"Video ID": list(local_videos_info.keys()), "Number of Segments": list(local_videos_info.values())}))
+    else:
+        st.info("No videos processed yet. Use the form above to add some!")
+
+elif page == "Model Training":
+    st.header("2. Model Training")
+    st.markdown("""
+    Train your VSR model using the locally prepared video segments.
+    """)
+
+    num_epochs = st.number_input("Number of Epochs", min_value=1, value=5, step=1)
+    batch_size = st.number_input("Batch Size", min_value=1, value=4, step=1)
+    learning_rate = st.number_input("Learning Rate", min_value=1e-6, value=1e-4, format="%.6f")
+
+    if st.button("Start Training"):
+        # The scan for training data needs to be based on the actual processed video folders
+        all_trainable_metadata = scan_local_segments_for_metadata()
+        if not all_trainable_metadata:
+            st.error("No processed video segments found for training. Please go to 'Data Preparation' and process some videos first.")
+        else:
+            st.info("Training started. This will run on your local machine's CPU or GPU(s) if available.")
+            train_model_streamlit(num_epochs, batch_size, learning_rate)
+
+elif page == "Prediction & Evaluation":
+    st.header("3. Prediction & Evaluation")
+    st.markdown("""
+    Test your trained model by uploading a video or selecting from previously processed data.
+    """)
+
+    # --- Load Trained Model ---
+    available_models = [f for f in os.listdir(LOCAL_MODELS_DIR) if f.endswith('.pth')]
+    char_map_instance_eval = CharMap(arabic_alphabet_str)
+
+    if not available_models:
+        st.warning("No trained models found in the 'models' directory. Please train a model first.")
+        loaded_model = None
+        device = None
+    else:
+        selected_model_name = st.selectbox("Select a trained model:", available_models)
+        if selected_model_name:
+            # The load_trained_model function is cached, so it's efficient.
+            loaded_model, device = load_trained_model(selected_model_name, char_map_instance_eval)
+
+    if loaded_model:
+        st.subheader("Predict from a Single Segment")
+        
+        # --- Data Selection for Prediction ---
+        all_metadata = scan_local_segments_for_metadata()
+        
+        if not all_metadata:
+            st.warning("No processed video segments found. Please go to 'Data Preparation' and process videos first.")
+        else:
+            # Create a Pandas DataFrame for easier filtering
+            metadata_df = pd.DataFrame(all_metadata)
+            
+            # --- UI for Selecting a Segment ---
+            # 1. Select Video ID
+            video_ids = sorted([str(vid) for vid in metadata_df['video_id'].unique()])
+            selected_video_id = st.selectbox("Select a Video ID:", video_ids)
+            
+            # 2. Filter segments for the chosen video
+            segments_for_video = metadata_df[metadata_df['video_id'] == selected_video_id]
+            
+            # Create a user-friendly option text for the selectbox
+            segments_for_video['option_text'] = segments_for_video.apply(
+                lambda row: f"{row['segment_id']}: \"{str(row['text'])[:50]}...\"", axis=1
+            )
+            
+            # 3. Select Segment
+            selected_option = st.selectbox("Select a Segment to Predict:", segments_for_video['option_text'])
+            
+            # Get the full metadata for the chosen segment
+            selected_segment_info = segments_for_video[segments_for_video['option_text'] == selected_option].iloc[0].to_dict()
+
+            if st.button("Run Prediction on Selected Segment"):
+                with st.spinner("Loading segment, preprocessing, and running prediction..."):
+                    try:
+                        # 1. Create a VSRDataset with only the selected segment
+                        # The dataset will handle unzipping and preprocessing
+                        predict_dataset = VSRDataset(
+                            char_map_instance=char_map_instance_eval,
+                            img_size=(IMG_HEIGHT, IMG_WIDTH),
+                            is_train=False, # No augmentations for prediction
+                            metadata_list_override=[selected_segment_info]
+                        )
+                        
+                        if len(predict_dataset) == 0 or predict_dataset[0] is None:
+                            st.error("Failed to load frames for the selected segment. The archive might be corrupt or empty.")
+                        else:
+                            # 2. Load the data
+                            # The dataset returns (frames_tensor, text_tensor)
+                            input_tensor, true_label_tensor = predict_dataset[0]
+                            
+                            # Add the batch dimension (B, T, C, H, W) as the model expects
+                            input_tensor = input_tensor.unsqueeze(0).to(device)
+
+                            # 3. Run the model
+                            # 3. Run the model
+                            with torch.no_grad():
+                                output_log_probs = loaded_model(input_tensor)
+                                                        
+                            # 4. Decode the output
+                            predicted_indices = torch.argmax(output_log_probs.cpu(), dim=2)[0].tolist()
+
+                            # --- START OF NEW DEBUGGING CODE ---
+                            st.markdown("---")
+                            st.subheader("🕵️‍♂️ Debug Information")
+                            st.write("**Input Tensor Shape:**", input_tensor.shape, "(Should be [1, T, 1, 96, 96])")
+                            st.write(f"**Input Tensor Min / Max / Mean:** `{input_tensor.min():.4f}` / `{input_tensor.max():.4f}` / `{input_tensor.mean():.4f}`")
+                            st.write("**Raw Predicted Indices (first 50):**")
+                            st.code(predicted_indices[:50])
+                            st.markdown("---")
+                            # --- END OF NEW DEBUGGING CODE ---
+
+                            predicted_text = char_map_instance_eval.indices_to_text(predicted_indices)
+                            
+                            # 5. Decode the ground truth for comparison
+                            true_text = char_map_instance_eval.indices_to_text(true_label_tensor.tolist(), remove_blanks=False, remove_duplicates=False)
+
+                            # 6. Display results
+                            st.success("Transcription Complete!")
+                            st.markdown("---")
+                            st.write("**Ground Truth:**")
+                            st.info(true_text)
+                            st.write("**Predicted Text:**")
+                            st.success(predicted_text)
+                            st.markdown("---")
+
+                            # Display a sample frame from the segment
+                            sample_frame = (input_tensor.cpu().numpy()[0, 0, 0, :, :] * 255).astype(np.uint8)
+                            st.write("**Sample Frame from Segment:**")
+                            st.image(sample_frame, caption=f"First frame of {selected_segment_info['segment_id']}", width=150)
+
+                    except Exception as e:
+                        st.error(f"An error occurred during prediction: {e}")
+                        traceback.print_exc()
+
+    # --- Evaluation Metrics Section ---
+    st.subheader("Model Evaluation on Datasets")
+    st.markdown("Calculate Word Error Rate (WER), Character Error Rate (CER), and corpus statistics for loaded data.")
+    
+    char_map_instance_eval = CharMap(arabic_alphabet_str) # Re-init for this section
+    
+    # Check if a model is loaded for evaluation
+    if loaded_model:
+        if st.button("Run Full Evaluation"):
+            st.info("Starting evaluation on training and validation sets. This may take some time...")
+            
+            all_segments_metadata_eval = scan_local_segments_for_metadata()
+            
+            if not all_segments_metadata_eval:
+                st.warning("No local data found for evaluation.")
+            else:
+                previous_val_segment_paths_eval = set()
+                if os.path.exists(VAL_SEGMENT_PATHS_FILE):
+                    with open(VAL_SEGMENT_PATHS_FILE, 'r') as f:
+                        previous_val_segment_paths_eval = set(json.load(f))
+                
+                final_val_metadata_eval = []
+                final_train_metadata_eval = []
+                
+                # Reconstruct train/val based on saved JSON
+                for m in all_segments_metadata_eval:
+                    if m['archive_path'] in previous_val_segment_paths_eval: # Use archive_path for checking
+                        final_val_metadata_eval.append(m)
+                    else:
+                        final_train_metadata_eval.append(m)
+
+                eval_train_dataset = VSRDataset(char_map_instance=char_map_instance_eval, img_size=(IMG_HEIGHT, IMG_WIDTH), is_train=False, metadata_list_override=final_train_metadata_eval)
+                eval_val_dataset = VSRDataset(char_map_instance=char_map_instance_eval, img_size=(IMG_HEIGHT, IMG_WIDTH), is_train=False, metadata_list_override=final_val_metadata_eval)
+
+                # Define a batch size for evaluation.
+                batch_size = 4 
+
+                eval_train_loader = torch.utils.data.DataLoader(dataset=eval_train_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, char_map_instance_for_collate=char_map_instance_eval), num_workers=0, pin_memory=False)
+                eval_val_loader = torch.utils.data.DataLoader(dataset=eval_val_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, char_map_instance_for_collate=char_map_instance_eval), num_workers=0, pin_memory=False)
+
+
+                with st.spinner("Calculating metrics for Validation Set..."):
+                    val_ground_truths = []
+                    val_predictions = []
+                    if len(eval_val_loader) > 0:
+                        with torch.no_grad():
+                            for batch_idx, data_batch in enumerate(eval_val_loader):
+                                if data_batch is None: continue
+                                padded_sequences_batch_first, padded_targets, seq_lengths, target_lengths = data_batch
+                                padded_sequences_batch_first = padded_sequences_batch_first.to(device)
+                                output_log_probs = loaded_model(padded_sequences_batch_first)
+                                predicted_indices_batch = torch.argmax(output_log_probs.cpu(), dim=2)
+                                for i in range(predicted_indices_batch.size(0)):
+                                    pred_text = char_map_instance_eval.indices_to_text(predicted_indices_batch[i].tolist())
+                                    true_text = char_map_instance_eval.indices_to_text(padded_targets[i][:target_lengths[i]].tolist(), remove_blanks=False, remove_duplicates=False)
+                                    val_predictions.append(pred_text)
+                                    val_ground_truths.append(true_text)
+                        
+                        if val_ground_truths and val_predictions:
+                            val_wer, val_cer = calculate_wer_cer(val_ground_truths, val_predictions)
+                            st.subheader("Validation Set Metrics:")
+                            st.metric(label="WER", value=f"{val_wer:.2f}%")
+                            st.metric(label="CER", value=f"{val_cer:.2f}%")
+                        else:
+                            st.info("No valid samples in validation set for WER/CER calculation.")
+                    else:
+                        st.info("Validation DataLoader is empty for evaluation.")
+
+                with st.spinner("Calculating metrics for Training Set..."):
+                    train_ground_truths = []
+                    train_predictions = []
+                    if len(eval_train_loader) > 0:
+                        with torch.no_grad():
+                            for batch_idx, data_batch in enumerate(eval_train_loader):
+                                if data_batch is None: continue
+                                padded_sequences_batch_first, padded_targets, seq_lengths, target_lengths = data_batch
+                                padded_sequences_batch_first = padded_sequences_batch_first.to(device)
+                                output_log_probs = loaded_model(padded_sequences_batch_first)
+                                predicted_indices_batch = torch.argmax(output_log_probs.cpu(), dim=2)
+                                for i in range(predicted_indices_batch.size(0)):
+                                    pred_text = char_map_instance_eval.indices_to_text(predicted_indices_batch[i].tolist())
+                                    true_text = char_map_instance_eval.indices_to_text(padded_targets[i][:target_lengths[i]].tolist(), remove_blanks=False, remove_duplicates=False)
+                                    train_predictions.append(pred_text)
+                                    train_ground_truths.append(true_text)
+                        
+                        if train_ground_truths and train_predictions:
+                            train_wer, train_cer = calculate_wer_cer(train_ground_truths, train_predictions)
+                            st.subheader("Training Set Metrics:")
+                            st.metric(label="WER", value=f"{train_wer:.2f}%")
+                            st.metric(label="CER", value=f"{train_cer:.2f}%")
+                        else:
+                            st.info("No valid samples in training set for WER/CER calculation.")
+                    else:
+                        st.info("Training DataLoader is empty for evaluation.")
+
+                st.subheader("Corpus Statistics:")
+                if eval_train_dataset:
+                    distinct_words_train, sentence_count_train, _ = compute_corpus_stats(eval_train_dataset, char_map_instance_eval)
+                    st.write(f"**Training Corpus:**")
+                    st.write(f"  - Number of distinct words: {distinct_words_train}")
+                    st.write(f"  - Number of sentences: {sentence_count_train}")
+                if eval_val_dataset:
+                    distinct_words_val, sentence_count_val, _ = compute_corpus_stats(eval_val_dataset, char_map_instance_eval)
+                    st.write(f"**Validation Corpus:**")
+                    st.write(f"  - Number of distinct words: {distinct_words_val}")
+                    st.write(f"  - Number of sentences: {sentence_count_val}")
+    else:
+        st.info("Load a model first to run evaluation metrics.")
+
+elif page == "Clear Data":
+    st.header("4. Clear Local Data")
+    st.markdown("""
+    Use this section to remove all downloaded videos, extracted segments, and saved models/checkpoints locally.
+    **Warning:** This action is irreversible!
+    """)
+    if st.button("Clear All Data (Videos, Segments, Models, Checkpoints, Logs)"):
+        with st.spinner("Clearing all local data..."):
+            try:
+                if os.path.exists(LOCAL_DATA_ROOT):
+                    video_id_folders_to_delete = [d for d in os.listdir(LOCAL_DATA_ROOT) if os.path.isdir(os.path.join(LOCAL_DATA_ROOT, d)) and d not in ["videos", "segments", "models", "checkpoints", "logs"]]
+                    for folder in video_id_folders_to_delete:
+                        shutil.rmtree(os.path.join(LOCAL_DATA_ROOT, folder))
+                    
+                    # Clear direct subfolders that are not video IDs
+                    if os.path.exists(LOCAL_VIDEO_DIR): shutil.rmtree(LOCAL_VIDEO_DIR); os.makedirs(LOCAL_VIDEO_DIR, exist_ok=True)
+                    # LOCAL_SEGMENTS_DIR is typically within video_id folders. If it exists separately, clear.
+
+                if os.path.exists(LOCAL_MODELS_DIR): shutil.rmtree(LOCAL_MODELS_DIR); os.makedirs(LOCAL_MODELS_DIR, exist_ok=True)
+                if os.path.exists(LOCAL_CHECKPOINTS_DIR): shutil.rmtree(LOCAL_CHECKPOINTS_DIR); os.makedirs(LOCAL_CHECKPOINTS_DIR, exist_ok=True)
+                if os.path.exists(LOCAL_LOSS_HISTORY_DIR): shutil.rmtree(LOCAL_LOSS_HISTORY_DIR); os.makedirs(LOCAL_LOSS_HISTORY_DIR, exist_ok=True)
+                
+                # Also delete the val_segment_paths.json file if it exists
+                if os.path.exists(VAL_SEGMENT_PATHS_FILE):
+                    os.remove(VAL_SEGMENT_PATHS_FILE)
+
+                st.success("All local data cleared successfully!")
+                st.cache_data.clear() # Clear Streamlit data cache
+                st.cache_resource.clear() # Clear Streamlit resource cache
+                st.experimental_rerun() # Rerun app to reflect changes
+            except Exception as e:
+                st.error(f"Error clearing data: {e}")
